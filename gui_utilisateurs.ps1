@@ -1,6 +1,6 @@
 ﻿# ============================================================
 # GUI - Gestionnaire Active Directory
-# Auteur : Gaël RAUTUREAU
+# Auteur : anotherj4ck
 # Description : Interface graphique de provisioning AD
 #               Création OUs, groupes et utilisateurs depuis CSV
 # ============================================================
