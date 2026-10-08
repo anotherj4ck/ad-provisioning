@@ -1,184 +1,185 @@
+#Requires -Version 5.1
 # ============================================================
-#  PROVISIONING AD - GUI Windows Forms v5
+#  PROVISIONING AD - GUI Windows Forms v6
 #  CSV unique : OUs / Groupes / Utilisateurs
 #  Auteur    : anotherj4ck
+#  Licence   : MIT
+# ============================================================
+#  Securite (details dans le README, section "Choix de securite") :
+#  - mots de passe provisoires generes en memoire, jamais saisis, jamais
+#    ecrits sur disque ni dans le journal, affiches une seule fois ;
+#  - changement de mot de passe force a la premiere connexion ;
+#  - mode simulation par defaut, saisies validees, recapitulatif et
+#    confirmation avant toute ecriture reelle dans l'AD.
 # ============================================================
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Import-Module ActiveDirectory
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# Logique sans AD ni interface (validation, mots de passe, CSV), testee par Pester
+. "$PSScriptRoot\src\ProvisioningCore.ps1"
+
+# ============================================================
+# MODULE ACTIVEDIRECTORY (RSAT)
+# ============================================================
+# Pas de "#Requires -Modules ActiveDirectory" : il arreterait le script sur
+# une erreur console, sans dire comment installer le module.
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    [System.Windows.Forms.MessageBox]::Show(
+        "Le module PowerShell ActiveDirectory est introuvable.`n`n" +
+        "Installez les outils RSAT depuis une console PowerShell lancee en administrateur :`n`n" +
+        "Windows 10 / 11 :`n" +
+        "Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0`n`n" +
+        "Windows Server :`n" +
+        "Install-WindowsFeature RSAT-AD-PowerShell",
+        "Module ActiveDirectory manquant", "OK", "Error") | Out-Null
+    return
+}
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+} catch {
+    [System.Windows.Forms.MessageBox]::Show(
+        "Impossible de charger le module ActiveDirectory :`n$_", "Module ActiveDirectory", "OK", "Error") | Out-Null
+    return
+}
 
 # ============================================================
 # CONSTANTES & CHEMINS
 # ============================================================
 $script:SEP        = " -> "
 $script:configPath = "$PSScriptRoot\config_ad.csv"
-$script:logPath    = "C:\Logs\provisioning_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+# Journal horodate a cote du script (logs\ est exclu du depot par .gitignore)
+$script:logPath    = "$PSScriptRoot\logs\provisioning_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 # ============================================================
 # DONNEES EN MEMOIRE
 # ============================================================
-$script:listeOUs     = [System.Collections.ArrayList]@()
-$script:listeGroupes = [System.Collections.ArrayList]@()
+$script:listeOUs     = [System.Collections.ArrayList]@()   # noms d'OU
+$script:listeGroupes = [System.Collections.ArrayList]@()   # objets { Nom ; OU }
 
 # ============================================================
 # FONCTIONS
 # ============================================================
 
-function Write-Log {
+function Write-Journal {
+    # Journal horodate : zone de texte de l'interface + fichier dans logs\.
+    # Ne jamais y passer de mot de passe.
     param([string]$Message, [string]$Level = "INFO")
-    $line = "[$(Get-Date -Format 'HH:mm:ss')] [$Level] $Message"
+    $heure = Get-Date
     if ($null -ne $txtLog -and $txtLog.IsHandleCreated) {
-        $txtLog.AppendText("$line`r`n")
+        $txtLog.AppendText("[$($heure.ToString('HH:mm:ss'))] [$Level] $Message`r`n")
         $txtLog.ScrollToCaret()
     }
-    $dir = Split-Path $script:logPath
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    Add-Content -Path $script:logPath -Value $line
+    try {
+        $dir = Split-Path $script:logPath
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        Add-Content -LiteralPath $script:logPath -Value "[$($heure.ToString('yyyy-MM-dd HH:mm:ss'))] [$Level] $Message" -Encoding UTF8
+    } catch {
+        if ($null -ne $txtLog -and $txtLog.IsHandleCreated) {
+            $txtLog.AppendText("[ERR] Ecriture du journal impossible ($($script:logPath)) : $_`r`n")
+        }
+    }
 }
 
-function Test-NomValide {
-    param([string]$Nom)
-    if ($Nom -match '[,\\#+<>;"=]') {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Nom invalide : caracteres interdits detectes.`nEvitez : , \ # + < > ; `" =",
-            "Validation", "OK", "Warning") | Out-Null
-        return $false
-    }
-    if ($Nom.Length -gt 64) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Nom trop long (max 64 caracteres).", "Validation", "OK", "Warning") | Out-Null
-        return $false
-    }
-    return $true
-}
-
-function Update-ComboboxOUs {
+function Sync-ListeOU {
+    # Repercute $script:listeOUs dans la liste, les listes deroulantes et la colonne OU de la grille.
+    $lstOU.Items.Clear()
     $cmbOUGroupe.Items.Clear()
     $cmbOUDefaut.Items.Clear()
-    foreach ($o in $script:listeOUs) {
-        $cmbOUGroupe.Items.Add($o) | Out-Null
-        $cmbOUDefaut.Items.Add($o) | Out-Null
+    $grid.Columns["OU"].Items.Clear()
+    foreach ($ou in $script:listeOUs) {
+        $lstOU.Items.Add($ou) | Out-Null
+        $cmbOUGroupe.Items.Add($ou) | Out-Null
+        $cmbOUDefaut.Items.Add($ou) | Out-Null
+        $grid.Columns["OU"].Items.Add($ou) | Out-Null
     }
 }
 
-function Update-ComboboxGroupes {
+function Sync-ListeGroupe {
+    # Repercute $script:listeGroupes dans la liste, la liste deroulante et la colonne Groupe.
+    # Entree vide en tete : le groupe d'un utilisateur est facultatif.
+    $lstGroupe.Items.Clear()
     $cmbGroupeDefaut.Items.Clear()
-    foreach ($entry in $script:listeGroupes) {
-        $idx = $entry.IndexOf($script:SEP)
-        $nom = $entry.Substring(0, $idx).Trim()
-        $cmbGroupeDefaut.Items.Add($nom) | Out-Null
+    $grid.Columns["Groupe"].Items.Clear()
+    $cmbGroupeDefaut.Items.Add("") | Out-Null
+    $grid.Columns["Groupe"].Items.Add("") | Out-Null
+    foreach ($g in $script:listeGroupes) {
+        $lstGroupe.Items.Add("$($g.Nom)$($script:SEP)$($g.OU)") | Out-Null
+        $cmbGroupeDefaut.Items.Add($g.Nom) | Out-Null
+        $grid.Columns["Groupe"].Items.Add($g.Nom) | Out-Null
     }
 }
 
-function Sync-GridColumns {
-    $colOU     = $grid.Columns["OU"]
-    $colGroupe = $grid.Columns["Groupe"]
-    $colOU.Items.Clear()
-    $colGroupe.Items.Clear()
-    foreach ($o in $script:listeOUs) { $colOU.Items.Add($o) | Out-Null }
-    foreach ($entry in $script:listeGroupes) {
-        $idx = $entry.IndexOf($script:SEP)
-        $nom = $entry.Substring(0, $idx).Trim()
-        $colGroupe.Items.Add($nom) | Out-Null
-    }
-}
-
-function Nettoyer-OrphansOU {
-    param([string]$OUSupprimee)
+function Clear-ReferenceOrpheline {
+    # Vide les cellules de la grille qui pointent vers une OU ou un groupe supprime.
+    param([string]$Colonne, [string]$Valeur)
     foreach ($row in $grid.Rows) {
-        if ($row.Cells["OU"].Value -eq $OUSupprimee) { $row.Cells["OU"].Value = $null }
+        if ($row.Cells[$Colonne].Value -eq $Valeur) { $row.Cells[$Colonne].Value = $null }
     }
 }
 
-function Nettoyer-OrphansGroupe {
-    param([string]$GroupeSupprime)
-    foreach ($row in $grid.Rows) {
-        if ($row.Cells["Groupe"].Value -eq $GroupeSupprime) { $row.Cells["Groupe"].Value = $null }
+function Clear-Saisie {
+    # Remet les champs de saisie manuelle sur leur texte d'aide (gris).
+    foreach ($ctrl in $pnlSaisie.Controls) {
+        if ($ctrl -is [System.Windows.Forms.TextBox]) {
+            $ctrl.Text      = $ctrl.Tag
+            $ctrl.ForeColor = [System.Drawing.Color]::Gray
+        }
     }
 }
 
-function Export-Config {
-    $lignes = [System.Collections.ArrayList]@()
-    $lignes.Add("Type;Nom;OU;Login;Prenom;Nom2;MotDePasse;Groupe") | Out-Null
-
-    foreach ($ou in $script:listeOUs) { $lignes.Add("OU;$ou;;;;;;;") | Out-Null }
-
-    foreach ($entry in $script:listeGroupes) {
-        $idx = $entry.IndexOf($script:SEP)
-        $nom = $entry.Substring(0, $idx).Trim()
-        $ou  = $entry.Substring($idx + $script:SEP.Length).Trim()
-        $lignes.Add("GROUPE;$nom;$ou;;;;;;") | Out-Null
-    }
-
+function Get-UtilisateurGrille {
+    # Lignes de la grille -> objets { Prenom ; Nom ; Login ; OU ; Groupe }
     foreach ($row in $grid.Rows) {
-        $prenom = $row.Cells["Prenom"].Value
-        $nom    = $row.Cells["Nom"].Value
-        $login  = $row.Cells["Login"].Value
-        $mdp    = $row.Cells["MotDePasse"].Value
-        $ou     = $row.Cells["OU"].Value
-        $grp    = $row.Cells["Groupe"].Value
-        if ($login) { $lignes.Add("USER;;$ou;$login;$prenom;$nom;$mdp;$grp") | Out-Null }
+        [PSCustomObject]@{
+            Prenom = ([string]$row.Cells["Prenom"].Value).Trim()
+            Nom    = ([string]$row.Cells["Nom"].Value).Trim()
+            Login  = ([string]$row.Cells["Login"].Value).Trim()
+            OU     = ([string]$row.Cells["OU"].Value).Trim()
+            Groupe = ([string]$row.Cells["Groupe"].Value).Trim()
+        }
     }
+}
 
-    $lignes | Set-Content -Path $script:configPath -Encoding UTF8
+function Save-Config {
+    # Sauvegarde OUs, groupes et utilisateurs dans le CSV de config (jamais de mot de passe).
+    Export-ConfigProvisioning -Chemin $script:configPath -OUs $script:listeOUs `
+        -Groupes $script:listeGroupes -Utilisateurs @(Get-UtilisateurGrille)
 }
 
 function Import-Config {
+    # Charge un CSV de config dans l'interface. Retourne la config lue, ou $null en cas d'erreur.
     param([string]$Chemin)
-    if (-not (Test-Path $Chemin)) { return }
+    try {
+        $config = Import-ConfigProvisioning -Chemin $Chemin
+    } catch {
+        Write-Journal "Lecture de la config impossible : $_" "ERR"
+        [System.Windows.Forms.MessageBox]::Show("Lecture de la config impossible :`n$_", "Erreur", "OK", "Error") | Out-Null
+        return $null
+    }
 
-    $data = Import-Csv -Path $Chemin -Delimiter ";"
-
+    $grid.Rows.Clear()
     $script:listeOUs.Clear()
     $script:listeGroupes.Clear()
-    $lstOU.Items.Clear()
-    $lstGroupe.Items.Clear()
-    $cmbOUGroupe.Items.Clear()
-    $cmbOUDefaut.Items.Clear()
-    $cmbGroupeDefaut.Items.Clear()
-    $grid.Rows.Clear()
-
-    foreach ($row in $data) {
-        if ($row.Type -eq "OU") {
-            $val = $row.Nom.Trim()
-            if ($val -ne "" -and $script:listeOUs -notcontains $val) {
-                $script:listeOUs.Add($val) | Out-Null
-                $lstOU.Items.Add($val) | Out-Null
-                $cmbOUGroupe.Items.Add($val) | Out-Null
-                $cmbOUDefaut.Items.Add($val) | Out-Null
-            }
-        }
+    foreach ($ou in $config.OUs)    { $script:listeOUs.Add($ou) | Out-Null }
+    foreach ($g in $config.Groupes) { $script:listeGroupes.Add($g) | Out-Null }
+    Sync-ListeOU
+    Sync-ListeGroupe
+    foreach ($u in $config.Utilisateurs) {
+        $grid.Rows.Add($u.Prenom, $u.Nom, $u.Login, $u.OU, $u.Groupe) | Out-Null
     }
 
-    foreach ($row in $data) {
-        if ($row.Type -eq "GROUPE") {
-            $nom   = $row.Nom.Trim()
-            $ou    = $row.OU.Trim()
-            $entry = "$nom$($script:SEP)$ou"
-            if ($nom -ne "" -and $ou -ne "" -and $script:listeGroupes -notcontains $entry) {
-                $script:listeGroupes.Add($entry) | Out-Null
-                $lstGroupe.Items.Add($entry) | Out-Null
-                $cmbGroupeDefaut.Items.Add($nom) | Out-Null
-            }
-        }
+    Write-Journal ("Config chargee : $Chemin ($($config.OUs.Count) OU, $($config.Groupes.Count) groupe(s), " +
+               "$($config.Utilisateurs.Count) utilisateur(s))") "INFO"
+    if ($config.ColonneMotDePasseIgnoree) {
+        Write-Journal ("Colonne MotDePasse (ancien format) ignoree : les mots de passe sont desormais generes. " +
+                   "Ce fichier contient des mots de passe en clair : re-exportez la config pour le reecrire sans eux.") "WARN"
     }
-
-    Sync-GridColumns
-
-    foreach ($row in $data) {
-        if ($row.Type -eq "USER") {
-            $prenom = $row.Prenom.Trim()
-            $nom2   = $row.Nom2.Trim()
-            $login  = $row.Login.Trim()
-            $mdp    = $row.MotDePasse.Trim()
-            $ou     = $row.OU.Trim()
-            $grp    = $row.Groupe.Trim()
-            if ($login -ne "") {
-                $grid.Rows.Add($prenom, $nom2, $login, $mdp, $ou, $grp) | Out-Null
-            }
-        }
-    }
+    foreach ($a in $config.Avertissements) { Write-Journal $a "WARN" }
+    $erreurs = @(Get-ErreurConfiguration -OUs $script:listeOUs -Groupes $script:listeGroupes -Utilisateurs @(Get-UtilisateurGrille))
+    foreach ($e in $erreurs) { Write-Journal "A corriger avant lancement : $e" "WARN" }
+    return $config
 }
 
 function Import-DepuisAD {
@@ -192,89 +193,337 @@ function Import-DepuisAD {
         $dcRoot  = $domaine.DistinguishedName
     } catch {
         [System.Windows.Forms.MessageBox]::Show(
-            "Impossible de contacter l'AD :`n$_", "Erreur AD", "OK", "Error")
+            "Impossible de contacter l'AD :`n$_", "Erreur AD", "OK", "Error") | Out-Null
         return
     }
 
+    $grid.Rows.Clear()
     $script:listeOUs.Clear()
     $script:listeGroupes.Clear()
-    $lstOU.Items.Clear()
-    $lstGroupe.Items.Clear()
-    $cmbOUGroupe.Items.Clear()
-    $cmbOUDefaut.Items.Clear()
-    $cmbGroupeDefaut.Items.Clear()
-    $grid.Rows.Clear()
 
     # OUs de niveau 1 sous la racine du domaine
     $ous = Get-ADOrganizationalUnit -Filter * -SearchBase $dcRoot -SearchScope OneLevel -ErrorAction SilentlyContinue
     foreach ($ou in $ous) {
-        $nom = $ou.Name
-        if ($script:listeOUs -notcontains $nom) {
-            $script:listeOUs.Add($nom) | Out-Null
-            $lstOU.Items.Add($nom) | Out-Null
-            $cmbOUGroupe.Items.Add($nom) | Out-Null
-            $cmbOUDefaut.Items.Add($nom) | Out-Null
-        }
+        if ($script:listeOUs -notcontains $ou.Name) { $script:listeOUs.Add($ou.Name) | Out-Null }
     }
 
-    # Groupes dans les OUs importees
-    $groupes = Get-ADGroup -Filter * -SearchBase $dcRoot -Properties DistinguishedName -ErrorAction SilentlyContinue
+    # Groupes dont l'OU parente fait partie des OUs importees
+    $groupes = Get-ADGroup -Filter * -SearchBase $dcRoot -ErrorAction SilentlyContinue
     foreach ($grp in $groupes) {
-        $nom     = $grp.Name
-        $dn      = $grp.DistinguishedName
-        $ouMatch = [regex]::Match($dn, '(?<=,OU=)[^,]+')
-        $ouNom   = if ($ouMatch.Success) { $ouMatch.Value } else { "" }
-        if ($ouNom -ne "" -and $script:listeOUs -contains $ouNom) {
-            $entry = "$nom$($script:SEP)$ouNom"
-            if ($script:listeGroupes -notcontains $entry) {
-                $script:listeGroupes.Add($entry) | Out-Null
-                $lstGroupe.Items.Add($entry) | Out-Null
-                $cmbGroupeDefaut.Items.Add($nom) | Out-Null
-            }
+        $ouMatch = [regex]::Match($grp.DistinguishedName, '(?<=,OU=)[^,]+')
+        if ($ouMatch.Success -and $script:listeOUs -contains $ouMatch.Value) {
+            $script:listeGroupes.Add([PSCustomObject]@{ Nom = $grp.Name; OU = $ouMatch.Value }) | Out-Null
         }
     }
 
-    Sync-GridColumns
+    Sync-ListeOU
+    Sync-ListeGroupe
 
-    # Utilisateurs dans les OUs connues (mot de passe laisse vide — illisible depuis l'AD)
-    $users = Get-ADUser -Filter * -SearchBase $dcRoot `
-        -Properties GivenName, Surname, DistinguishedName, MemberOf `
+    # Utilisateurs des OUs importees (pas de mot de passe : il n'est pas lisible dans l'AD)
+    $nomsGroupes = @($script:listeGroupes | ForEach-Object { $_.Nom })
+    $users = Get-ADUser -Filter * -SearchBase $dcRoot -Properties GivenName, Surname, MemberOf `
         -ErrorAction SilentlyContinue
     foreach ($user in $users) {
-        $login   = $user.SamAccountName
-        $dn      = $user.DistinguishedName
-        $ouMatch = [regex]::Match($dn, '(?<=,OU=)[^,]+')
-        $ouNom   = if ($ouMatch.Success) { $ouMatch.Value } else { "" }
-        if ($ouNom -eq "" -or $script:listeOUs -notcontains $ouNom) { continue }
+        $ouMatch = [regex]::Match($user.DistinguishedName, '(?<=,OU=)[^,]+')
+        if (-not $ouMatch.Success -or $script:listeOUs -notcontains $ouMatch.Value) { continue }
 
         $grpNom = ""
         foreach ($memberDN in $user.MemberOf) {
-            $grpMatch = [regex]::Match($memberDN, 'CN=([^,]+)')
-            if ($grpMatch.Success) {
-                $candidate = $grpMatch.Groups[1].Value
-                foreach ($entry in $script:listeGroupes) {
-                    $idx = $entry.IndexOf($script:SEP)
-                    if ($entry.Substring(0, $idx).Trim() -eq $candidate) {
-                        $grpNom = $candidate; break
-                    }
-                }
-                if ($grpNom -ne "") { break }
+            $grpMatch = [regex]::Match($memberDN, '^CN=([^,]+)')
+            if ($grpMatch.Success -and $nomsGroupes -contains $grpMatch.Groups[1].Value) {
+                $grpNom = $grpMatch.Groups[1].Value
+                break
             }
         }
-
-        $grid.Rows.Add($user.GivenName, $user.Surname, $login, "", $ouNom, $grpNom) | Out-Null
+        $grid.Rows.Add($user.GivenName, $user.Surname, $user.SamAccountName, $ouMatch.Value, $grpNom) | Out-Null
     }
 
+    $resume = "$($script:listeOUs.Count) OU(s)   |   $($script:listeGroupes.Count) groupe(s)   |   $($grid.Rows.Count) utilisateur(s)"
+    Write-Journal "Lecture AD terminee : $resume" "INFO"
     [System.Windows.Forms.MessageBox]::Show(
-        "Lecture AD terminee.`n$($script:listeOUs.Count) OU(s)   |   $($script:listeGroupes.Count) groupe(s)   |   $($grid.Rows.Count) utilisateur(s)`n`nNote : les mots de passe ne sont pas recuperables depuis l'AD.",
-        "Lecture AD", "OK", "Information")
+        "Lecture AD terminee.`n$resume", "Lecture AD", "OK", "Information") | Out-Null
+}
+
+function Invoke-Provisioning {
+    <#
+    .SYNOPSIS
+    Ecrit OUs, groupes et utilisateurs dans l'AD, ou simule l'operation.
+    .DESCRIPTION
+    En simulation, seules des lectures sont faites (l'objet existe-t-il deja ?)
+    et chaque ecriture est seulement journalisee. -WhatIf des cmdlets AD n'est
+    pas utilise : sa sortie va a la console et non au journal.
+    Les mots de passe provisoires sont ajoutes a -MotsDePasse (memoire seulement)
+    des que le compte est cree : si le traitement s'interrompt, l'appelant peut
+    quand meme afficher ceux des comptes deja crees.
+    Retourne le nombre d'erreurs.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'Mot de passe genere en memoire par New-MotDePasseProvisoire, jamais lu depuis un fichier ni une saisie.')]
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory)][string]$DomaineDN,
+        [Parameter(Mandatory)][string]$DomaineDNS,
+        [string[]]$OUs = @(),
+        [object[]]$Groupes = @(),
+        [object[]]$Utilisateurs = @(),
+        [string]$OUDediee = "",
+        [bool]$Simulation = $true,
+        [bool]$ReinitialiserMdpExistants = $false,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$MotsDePasse,
+        [scriptblock]$Progression = {}
+    )
+
+    $erreurs   = 0
+    $etape     = 0
+    $ousACreer = @($OUs)
+    if ($OUDediee -and $ousACreer -notcontains $OUDediee) { $ousACreer += $OUDediee }
+    $total = [Math]::Max(1, $ousACreer.Count + $Groupes.Count + $Utilisateurs.Count)
+
+    # -- ETAPE 1 : OUs (dont l'OU dediee aux groupes)
+    Write-Journal "--- Etape 1 : OUs ---" "INFO"
+    foreach ($ou in $ousACreer) {
+        try {
+            $existe = Get-ADOrganizationalUnit -LDAPFilter "(ou=$(ConvertTo-ValeurFiltreLdap $ou))" `
+                -SearchBase $DomaineDN -SearchScope OneLevel -ErrorAction Stop
+            if ($existe) {
+                Write-Journal "OU existe deja : $ou" "INFO"
+            } elseif ($Simulation) {
+                Write-Journal "[SIMULATION] OU serait creee : $ou" "SIMU"
+            } else {
+                New-ADOrganizationalUnit -Name $ou -Path $DomaineDN -ErrorAction Stop
+                Write-Journal "OU creee : $ou" "OK"
+            }
+        } catch { $erreurs++; Write-Journal "Erreur OU $ou : $_" "ERR" }
+        $etape++; & $Progression $etape $total
+    }
+
+    # -- ETAPE 2 : Groupes
+    Write-Journal "--- Etape 2 : Groupes ---" "INFO"
+    foreach ($g in $Groupes) {
+        $ouCible = if ($OUDediee) { $OUDediee } else { $g.OU }
+        try {
+            $existe = Get-ADGroup -LDAPFilter "(sAMAccountName=$(ConvertTo-ValeurFiltreLdap $g.Nom))" -ErrorAction Stop
+            if ($existe) {
+                Write-Journal "Groupe existe deja : $($g.Nom)" "INFO"
+            } elseif ($Simulation) {
+                Write-Journal "[SIMULATION] Groupe serait cree : $($g.Nom) (OU $ouCible)" "SIMU"
+            } else {
+                New-ADGroup -Name $g.Nom -SamAccountName $g.Nom -GroupScope Global -GroupCategory Security `
+                    -Path "OU=$ouCible,$DomaineDN" -ErrorAction Stop
+                Write-Journal "Groupe cree : $($g.Nom) (OU $ouCible)" "OK"
+            }
+        } catch { $erreurs++; Write-Journal "Erreur groupe $($g.Nom) : $_" "ERR" }
+        $etape++; & $Progression $etape $total
+    }
+
+    # -- ETAPE 3 : Utilisateurs
+    Write-Journal "--- Etape 3 : Utilisateurs ---" "INFO"
+    foreach ($u in $Utilisateurs) {
+        $login      = $u.Login
+        $ouDN       = "OU=$($u.OU),$DomaineDN"
+        $nomComplet = "$($u.Prenom) $($u.Nom)".Trim()
+        if (-not $nomComplet) { $nomComplet = $login }
+
+        try {
+            $existant = Get-ADUser -LDAPFilter "(sAMAccountName=$(ConvertTo-ValeurFiltreLdap $login))" -ErrorAction Stop
+            if ($existant) {
+                # Le GUID ne change pas quand le compte est deplace, contrairement au DN.
+                $id = $existant.ObjectGUID
+
+                # OU parente = DN sans son premier RDN (une virgule echappee "\," fait partie du RDN)
+                $parent = $existant.DistinguishedName -replace '^(?:\\.|[^,\\])*,', ''
+                if ($parent -ne $ouDN) {
+                    if ($Simulation) {
+                        Write-Journal "[SIMULATION] $login serait deplace vers $($u.OU)" "SIMU"
+                    } else {
+                        Move-ADObject -Identity $id -TargetPath $ouDN -ErrorAction Stop
+                        Write-Journal "  -> $login deplace vers $($u.OU)" "OK"
+                    }
+                }
+
+                # Une cellule vide n'efface pas l'attribut deja present dans l'AD.
+                $attributs = @{}
+                if ($u.Prenom) { $attributs.GivenName = $u.Prenom }
+                if ($u.Nom)    { $attributs.Surname   = $u.Nom }
+                if ($u.Prenom -or $u.Nom) { $attributs.DisplayName = $nomComplet }
+                if ($Simulation) {
+                    Write-Journal "[SIMULATION] Utilisateur existant, serait mis a jour : $login" "SIMU"
+                } elseif ($attributs.Count -gt 0) {
+                    Set-ADUser -Identity $id @attributs -ErrorAction Stop
+                    Write-Journal "Utilisateur existant mis a jour : $login" "OK"
+                } else {
+                    Write-Journal "Utilisateur existant, rien a mettre a jour : $login" "INFO"
+                }
+
+                # Le mot de passe d'un compte existant n'est jamais touche sans la case explicite.
+                if ($ReinitialiserMdpExistants) {
+                    if ($Simulation) {
+                        Write-Journal "[SIMULATION] Mot de passe de $login serait reinitialise (changement force)" "SIMU"
+                    } else {
+                        try {
+                            $mdp = New-MotDePasseProvisoire
+                            Set-ADAccountPassword -Identity $id -Reset -ErrorAction Stop `
+                                -NewPassword (ConvertTo-SecureString $mdp -AsPlainText -Force)
+                            # Ajoute avant l'etape suivante : si elle echoue, l'admin doit
+                            # quand meme connaitre le nouveau mot de passe.
+                            $MotsDePasse.Add([PSCustomObject]@{ Login = $login; MotDePasse = $mdp })
+                            Set-ADUser -Identity $id -ChangePasswordAtLogon $true -ErrorAction Stop
+                            Write-Journal "Mot de passe reinitialise : $login (changement force a la prochaine connexion)" "WARN"
+                        } catch { $erreurs++; Write-Journal "Erreur reinitialisation du mot de passe de $login : $_" "ERR" }
+                    }
+                }
+            } else {
+                if ($Simulation) {
+                    Write-Journal "[SIMULATION] Utilisateur serait cree : $login (OU $($u.OU), mot de passe provisoire, changement force)" "SIMU"
+                } else {
+                    $mdp = New-MotDePasseProvisoire
+                    $params = @{
+                        SamAccountName        = $login
+                        UserPrincipalName     = "$login@$DomaineDNS"
+                        Name                  = $nomComplet
+                        DisplayName           = $nomComplet
+                        Path                  = $ouDN
+                        AccountPassword       = (ConvertTo-SecureString $mdp -AsPlainText -Force)
+                        ChangePasswordAtLogon = $true
+                        Enabled               = $true
+                    }
+                    if ($u.Prenom) { $params.GivenName = $u.Prenom }
+                    if ($u.Nom)    { $params.Surname   = $u.Nom }
+                    New-ADUser @params -ErrorAction Stop
+                    $MotsDePasse.Add([PSCustomObject]@{ Login = $login; MotDePasse = $mdp })
+                    Write-Journal "Utilisateur cree : $login (changement de mot de passe force a la premiere connexion)" "OK"
+                }
+            }
+        } catch {
+            $erreurs++
+            Write-Journal "Erreur utilisateur $login : $_" "ERR"
+            $etape++; & $Progression $etape $total
+            continue
+        }
+
+        if ($u.Groupe) {
+            if ($Simulation) {
+                Write-Journal "[SIMULATION] $login serait ajoute au groupe $($u.Groupe)" "SIMU"
+            } else {
+                try {
+                    Add-ADGroupMember -Identity $u.Groupe -Members $login -ErrorAction Stop
+                    Write-Journal "  -> $login ajoute a $($u.Groupe)" "OK"
+                } catch { $erreurs++; Write-Journal "  -> Erreur groupe $($u.Groupe) pour $login : $_" "ERR" }
+            }
+        }
+        $etape++; & $Progression $etape $total
+    }
+
+    return $erreurs
+}
+
+function Copy-TexteSensible {
+    # Copie dans le presse-papiers en demandant a Windows de ne garder le contenu ni
+    # dans l'historique (Win+V) ni dans le presse-papiers cloud : formats documentes
+    # par Microsoft et utilises par les gestionnaires de mots de passe. La valeur
+    # attendue (DWORD 0) est fournie sous forme de flux d'octets.
+    param([Parameter(Mandatory)][string]$Texte)
+    $donnees = New-Object System.Windows.Forms.DataObject
+    $donnees.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $Texte)
+    foreach ($format in @("ExcludeClipboardContentFromMonitorProcessing", "CanIncludeInClipboardHistory", "CanUploadToCloudClipboard")) {
+        $donnees.SetData($format, [System.IO.MemoryStream]::new([byte[]](0, 0, 0, 0)))
+    }
+    [System.Windows.Forms.Clipboard]::SetDataObject($donnees, $true, 5, 100)
+}
+
+function Show-MotDePasseProvisoire {
+    # Affiche UNE seule fois les mots de passe provisoires : ils ne sont ecrits
+    # ni sur disque ni dans le journal, et sont oublies a la fermeture.
+    param([Parameter(Mandatory)][object[]]$MotsDePasse)
+
+    $texte = (@("Login`tMot de passe provisoire") +
+              @($MotsDePasse | ForEach-Object { "$($_.Login)`t$($_.MotDePasse)" })) -join "`r`n"
+
+    $fen                 = New-Object System.Windows.Forms.Form
+    $fen.Text            = "Mots de passe provisoires ($($MotsDePasse.Count))"
+    $fen.Size            = New-Object System.Drawing.Size(560, 430)
+    $fen.StartPosition   = "CenterParent"
+    $fen.FormBorderStyle = "FixedDialog"
+    $fen.MaximizeBox     = $false
+    $fen.MinimizeBox     = $false
+    $fen.Font            = New-Object System.Drawing.Font("Segoe UI", 9)
+
+    $lblAvert           = New-Object System.Windows.Forms.Label
+    $lblAvert.Text      = "Affichage unique : ces mots de passe ne sont ecrits ni sur disque ni dans le journal.`n" +
+                          "Transmettez-les par un canal sur ; chaque utilisateur devra changer le sien a la premiere connexion.`n" +
+                          "Le presse-papiers est vide a la fermeture de cette fenetre."
+    $lblAvert.Location  = New-Object System.Drawing.Point(15, 12)
+    $lblAvert.Size      = New-Object System.Drawing.Size(515, 70)
+    $lblAvert.ForeColor = [System.Drawing.Color]::DarkRed
+    $fen.Controls.Add($lblAvert)
+
+    $txtMdp            = New-Object System.Windows.Forms.TextBox
+    $txtMdp.Multiline  = $true
+    $txtMdp.ReadOnly   = $true
+    $txtMdp.WordWrap   = $false
+    $txtMdp.ScrollBars = "Vertical"
+    $txtMdp.Font       = New-Object System.Drawing.Font("Consolas", 10)
+    $txtMdp.Location   = New-Object System.Drawing.Point(15, 88)
+    $txtMdp.Size       = New-Object System.Drawing.Size(515, 242)
+    $txtMdp.Text       = $texte
+    $fen.Controls.Add($txtMdp)
+
+    $btnCopier          = New-Object System.Windows.Forms.Button
+    $btnCopier.Text     = "Copier"
+    $btnCopier.Location = New-Object System.Drawing.Point(15, 342)
+    $btnCopier.Size     = New-Object System.Drawing.Size(100, 30)
+    $fen.Controls.Add($btnCopier)
+
+    $lblCopie           = New-Object System.Windows.Forms.Label
+    $lblCopie.Location  = New-Object System.Drawing.Point(125, 349)
+    $lblCopie.Size      = New-Object System.Drawing.Size(295, 18)
+    $lblCopie.ForeColor = [System.Drawing.Color]::Gray
+    $fen.Controls.Add($lblCopie)
+
+    $btnFermer          = New-Object System.Windows.Forms.Button
+    $btnFermer.Text     = "Fermer"
+    $btnFermer.Location = New-Object System.Drawing.Point(430, 342)
+    $btnFermer.Size     = New-Object System.Drawing.Size(100, 30)
+    $fen.Controls.Add($btnFermer)
+    $fen.ActiveControl = $btnCopier   # sinon tout le texte apparait selectionne a l'ouverture
+
+    $btnCopier.Add_Click({
+        try {
+            Copy-TexteSensible -Texte $texte
+            $lblCopie.Text = "Copie dans le presse-papiers."
+        } catch {
+            $lblCopie.Text = "Copie impossible : $_"
+        }
+    })
+    $btnFermer.Add_Click({ $fen.Close() })
+    $fen.Add_FormClosing({
+        # $_ : arguments de l'evenement (FormClosingEventArgs)
+        $rep = [System.Windows.Forms.MessageBox]::Show(
+            "Ces mots de passe ne pourront plus etre affiches.`nLes avez-vous copies ou transmis ?`n`nFermer la fenetre ?",
+            "Mots de passe provisoires", "YesNo", "Warning", "Button2")
+        if ($rep -ne "Yes") { $_.Cancel = $true }
+    })
+
+    $fen.ShowDialog() | Out-Null
+
+    # Nettoyage : on vide le presse-papiers s'il contient encore ces mots de passe.
+    try {
+        if ([System.Windows.Forms.Clipboard]::ContainsText() -and [System.Windows.Forms.Clipboard]::GetText() -eq $texte) {
+            [System.Windows.Forms.Clipboard]::Clear()
+        }
+    } catch {
+        Write-Journal "Presse-papiers inaccessible, videz-le manuellement : $_" "WARN"
+    }
+    $txtMdp.Clear()
+    $fen.Dispose()
 }
 
 # ============================================================
 # FENETRE PRINCIPALE
 # ============================================================
 $form                 = New-Object System.Windows.Forms.Form
-$form.Text            = "Provisioning AD v5"
+$form.Text            = "Provisioning AD v6"
 $form.Size            = New-Object System.Drawing.Size(820, 860)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
@@ -332,23 +581,26 @@ $tabOU.Controls.Add($lstOU)
 
 $btnAjouterOU.Add_Click({
     $val = $txtOU.Text.Trim()
-    if ($val -ne "" -and (Test-NomValide $val) -and $script:listeOUs -notcontains $val) {
-        $script:listeOUs.Add($val) | Out-Null
-        $lstOU.Items.Add($val) | Out-Null
-        Update-ComboboxOUs
-        Sync-GridColumns
-        $txtOU.Clear()
+    $err = Get-ErreurNomAD -Nom $val
+    if ($err) {
+        [System.Windows.Forms.MessageBox]::Show($err, "Nom d'OU invalide", "OK", "Warning") | Out-Null
+        return
     }
+    if ($script:listeOUs -contains $val) {
+        [System.Windows.Forms.MessageBox]::Show("L'OU '$val' est deja dans la liste.", "Attention") | Out-Null
+        return
+    }
+    $script:listeOUs.Add($val) | Out-Null
+    Sync-ListeOU
+    $txtOU.Clear()
 })
 
 $btnSupprimerOU.Add_Click({
     if ($lstOU.SelectedItem) {
-        $val = $lstOU.SelectedItem
+        $val = [string]$lstOU.SelectedItem
         $script:listeOUs.Remove($val)
-        $lstOU.Items.Remove($val)
-        Update-ComboboxOUs
-        Sync-GridColumns
-        Nettoyer-OrphansOU -OUSupprimee $val
+        Sync-ListeOU
+        Clear-ReferenceOrpheline -Colonne "OU" -Valeur $val
     }
 })
 
@@ -399,31 +651,33 @@ $tabGroupe.Controls.Add($lstGroupe)
 
 $btnAjouterGroupe.Add_Click({
     $nom = $txtGroupe.Text.Trim()
-    $ou  = $cmbOUGroupe.SelectedItem
-    if ($nom -ne "" -and $ou -and (Test-NomValide $nom)) {
-        $entry = "$nom$($script:SEP)$ou"
-        if ($script:listeGroupes -notcontains $entry) {
-            $script:listeGroupes.Add($entry) | Out-Null
-            $lstGroupe.Items.Add($entry) | Out-Null
-            $cmbGroupeDefaut.Items.Add($nom) | Out-Null
-            Sync-GridColumns
-            $txtGroupe.Clear()
-        }
-    } else {
-        [System.Windows.Forms.MessageBox]::Show("Remplis le nom et choisis une OU.", "Attention")
+    $ou  = [string]$cmbOUGroupe.SelectedItem
+    if (-not $ou) {
+        [System.Windows.Forms.MessageBox]::Show("Choisis l'OU cible du groupe.", "Attention") | Out-Null
+        return
     }
+    $err = Get-ErreurNomAD -Nom $nom
+    if ($err) {
+        [System.Windows.Forms.MessageBox]::Show($err, "Nom de groupe invalide", "OK", "Warning") | Out-Null
+        return
+    }
+    if (@($script:listeGroupes | Where-Object { $_.Nom -eq $nom }).Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Le groupe '$nom' est deja dans la liste (un nom de groupe est unique dans le domaine).", "Attention") | Out-Null
+        return
+    }
+    $script:listeGroupes.Add([PSCustomObject]@{ Nom = $nom; OU = $ou }) | Out-Null
+    Sync-ListeGroupe
+    $txtGroupe.Clear()
 })
 
 $btnSupprimerGroupe.Add_Click({
-    if ($lstGroupe.SelectedItem) {
-        $entry = $lstGroupe.SelectedItem
-        $idx   = $entry.IndexOf($script:SEP)
-        $nom   = $entry.Substring(0, $idx).Trim()
-        $script:listeGroupes.Remove($entry)
-        $lstGroupe.Items.Remove($entry)
-        Update-ComboboxGroupes
-        Sync-GridColumns
-        Nettoyer-OrphansGroupe -GroupeSupprime $nom
+    $i = $lstGroupe.SelectedIndex
+    if ($i -ge 0) {
+        $nom = $script:listeGroupes[$i].Nom
+        $script:listeGroupes.RemoveAt($i)
+        Sync-ListeGroupe
+        Clear-ReferenceOrpheline -Colonne "Groupe" -Valeur $nom
     }
 })
 
@@ -461,7 +715,7 @@ $btnAjouterUser.Location = New-Object System.Drawing.Point(600, 11)
 $btnAjouterUser.Size     = New-Object System.Drawing.Size(120, 26)
 $tabUser.Controls.Add($btnAjouterUser)
 
-# Panneau saisie manuelle
+# Panneau saisie manuelle (aucun champ mot de passe : il est genere a la creation)
 $pnlSaisie          = New-Object System.Windows.Forms.Panel
 $pnlSaisie.Location = New-Object System.Drawing.Point(15, 45)
 $pnlSaisie.Size     = New-Object System.Drawing.Size(735, 35)
@@ -469,10 +723,9 @@ $pnlSaisie.Visible  = $false
 $tabUser.Controls.Add($pnlSaisie)
 
 foreach ($info in @(
-    @{Name="txtSaisiePrenom"; PlaceHolder="Prenom";     X=0},
-    @{Name="txtSaisieNom";    PlaceHolder="Nom";        X=110},
-    @{Name="txtSaisieLogin";  PlaceHolder="Login";      X=220},
-    @{Name="txtSaisieMdp";    PlaceHolder="MotDePasse"; X=330}
+    @{Name="txtSaisiePrenom"; PlaceHolder="Prenom"; X=0},
+    @{Name="txtSaisieNom";    PlaceHolder="Nom";    X=110},
+    @{Name="txtSaisieLogin";  PlaceHolder="Login";  X=220}
 )) {
     $t              = New-Object System.Windows.Forms.TextBox
     $t.Location     = New-Object System.Drawing.Point($info.X, 5)
@@ -484,11 +737,9 @@ foreach ($info in @(
     $t.Add_Enter({
         if ($this.ForeColor -eq [System.Drawing.Color]::Gray) {
             $this.Text = ""; $this.ForeColor = [System.Drawing.Color]::Black
-            if ($this.Name -eq "txtSaisieMdp") { $this.PasswordChar = [char]9679 }
         }
     })
     $t.Add_Leave({
-        if ($this.Name -eq "txtSaisieMdp") { $this.PasswordChar = [char]0 }
         if ($this.Text -eq "") { $this.ForeColor = [System.Drawing.Color]::Gray; $this.Text = $this.Tag }
     })
     $pnlSaisie.Controls.Add($t)
@@ -496,51 +747,46 @@ foreach ($info in @(
 
 $btnConfirmerUser          = New-Object System.Windows.Forms.Button
 $btnConfirmerUser.Text     = "OK"
-$btnConfirmerUser.Location = New-Object System.Drawing.Point(440, 3)
+$btnConfirmerUser.Location = New-Object System.Drawing.Point(330, 3)
 $btnConfirmerUser.Size     = New-Object System.Drawing.Size(50, 26)
 $pnlSaisie.Controls.Add($btnConfirmerUser)
 
 $btnAnnulerUser          = New-Object System.Windows.Forms.Button
 $btnAnnulerUser.Text     = "Annuler"
-$btnAnnulerUser.Location = New-Object System.Drawing.Point(498, 3)
+$btnAnnulerUser.Location = New-Object System.Drawing.Point(388, 3)
 $btnAnnulerUser.Size     = New-Object System.Drawing.Size(65, 26)
 $pnlSaisie.Controls.Add($btnAnnulerUser)
 
 $btnAjouterUser.Add_Click({ $pnlSaisie.Visible = $true })
 
 $btnAnnulerUser.Add_Click({
-    foreach ($ctrl in $pnlSaisie.Controls) {
-        if ($ctrl -is [System.Windows.Forms.TextBox]) {
-            $ctrl.PasswordChar  = [char]0
-            $ctrl.Text          = $ctrl.Tag
-            $ctrl.ForeColor     = [System.Drawing.Color]::Gray
-        }
-    }
+    Clear-Saisie
     $pnlSaisie.Visible = $false
 })
 
 $btnConfirmerUser.Add_Click({
-    $prenom = $pnlSaisie.Controls["txtSaisiePrenom"].Text.Trim()
-    $nom2   = $pnlSaisie.Controls["txtSaisieNom"].Text.Trim()
-    $login  = $pnlSaisie.Controls["txtSaisieLogin"].Text.Trim()
-    $mdp    = $pnlSaisie.Controls["txtSaisieMdp"].Text.Trim()
-    $ou     = if ($cmbOUDefaut.SelectedItem)     { $cmbOUDefaut.SelectedItem }     else { "" }
-    $grp    = if ($cmbGroupeDefaut.SelectedItem) { $cmbGroupeDefaut.SelectedItem } else { "" }
-
-    $placeholders = @("Prenom","Nom","Login","MotDePasse")
-    if ($login -ne "" -and $login -notin $placeholders) {
-        $grid.Rows.Add($prenom, $nom2, $login, $mdp, $ou, $grp) | Out-Null
-        foreach ($ctrl in $pnlSaisie.Controls) {
-            if ($ctrl -is [System.Windows.Forms.TextBox]) {
-                $ctrl.PasswordChar = [char]0
-                $ctrl.Text         = $ctrl.Tag
-                $ctrl.ForeColor    = [System.Drawing.Color]::Gray
-            }
-        }
-        $pnlSaisie.Visible = $false
-    } else {
-        [System.Windows.Forms.MessageBox]::Show("Login obligatoire.", "Attention")
+    # Un champ gris affiche encore son texte d'aide : il est vide.
+    $champs = @{}
+    foreach ($nom in @("Prenom", "Nom", "Login")) {
+        $ctrl = $pnlSaisie.Controls["txtSaisie$nom"]
+        $champs[$nom] = if ($ctrl.ForeColor -eq [System.Drawing.Color]::Gray) { "" } else { $ctrl.Text.Trim() }
     }
+
+    $err = Get-ErreurLogin -Login $champs.Login
+    if ($err) {
+        [System.Windows.Forms.MessageBox]::Show($err, "Login invalide", "OK", "Warning") | Out-Null
+        return
+    }
+    if (@(Get-UtilisateurGrille | Where-Object { $_.Login -eq $champs.Login }).Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show("Le login '$($champs.Login)' est deja dans la liste.", "Attention") | Out-Null
+        return
+    }
+
+    $ou  = if ($cmbOUDefaut.SelectedItem)     { [string]$cmbOUDefaut.SelectedItem }     else { "" }
+    $grp = if ($cmbGroupeDefaut.SelectedItem) { [string]$cmbGroupeDefaut.SelectedItem } else { "" }
+    $grid.Rows.Add($champs.Prenom, $champs.Nom, $champs.Login, $ou, $grp) | Out-Null
+    Clear-Saisie
+    $pnlSaisie.Visible = $false
 })
 
 # DataGridView
@@ -554,7 +800,7 @@ $grid.ColumnHeadersHeightSizeMode  = "AutoSize"
 $grid.Font                         = New-Object System.Drawing.Font("Segoe UI", 8.5)
 $grid.SelectionMode                = "FullRowSelect"
 
-foreach ($col in @("Prenom","Nom","Login","MotDePasse")) {
+foreach ($col in @("Prenom","Nom","Login")) {
     $c            = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $c.HeaderText = $col; $c.Name = $col
     $grid.Columns.Add($c) | Out-Null
@@ -567,39 +813,14 @@ foreach ($col in @("OU","Groupe")) {
 }
 $tabUser.Controls.Add($grid)
 
-# Masquage mot de passe dans la grille
-$grid.Add_CellFormatting({
-    param($s, $e)
-    if ($e.ColumnIndex -ge 0 -and $grid.Columns[$e.ColumnIndex].Name -eq "MotDePasse") {
-        if ($e.Value -ne $null -and $e.Value.ToString() -ne "") {
-            $e.Value = [string]::new([char]9679, $e.Value.ToString().Length)
-            $e.FormattingApplied = $true
-        }
-    }
-})
-
-$grid.Add_EditingControlShowing({
-    param($s, $e)
-    if ($grid.CurrentCell -ne $null -and $grid.Columns[$grid.CurrentCell.ColumnIndex].Name -eq "MotDePasse") {
-        if ($e.Control -is [System.Windows.Forms.TextBox]) {
-            ([System.Windows.Forms.TextBox]$e.Control).PasswordChar = [char]9679
-        }
-    } elseif ($e.Control -is [System.Windows.Forms.TextBox]) {
-        ([System.Windows.Forms.TextBox]$e.Control).PasswordChar = [char]0
-    }
-})
-
 # Supprime le dialog d'erreur DataGridView pour les combobox orphelines
-$grid.Add_DataError({
-    param($s, $e)
-    $e.Cancel = $true
-})
+$grid.Add_DataError({ $_.Cancel = $true })
 
 # ============================================================
 # BARRE CONFIG CSV
 # ============================================================
 $grpBoxConfig          = New-Object System.Windows.Forms.GroupBox
-$grpBoxConfig.Text     = "Fichier de configuration (config_ad.csv)"
+$grpBoxConfig.Text     = "Fichier de configuration (config_ad.csv, sans mot de passe)"
 $grpBoxConfig.Location = New-Object System.Drawing.Point(10, 540)
 $grpBoxConfig.Size     = New-Object System.Drawing.Size(780, 65)
 $grpBoxConfig.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
@@ -639,10 +860,16 @@ $grpBoxConfig.Controls.Add($btnOuvrirConfig)
 $btnLireAD.Add_Click({ Import-DepuisAD })
 
 $btnExporterConfig.Add_Click({
-    Export-Config
+    try {
+        Save-Config
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Export impossible :`n$_", "Erreur", "OK", "Error") | Out-Null
+        return
+    }
+    Write-Journal "Config exportee (sans mot de passe) : $($script:configPath)" "INFO"
     $lblConfigActif.Text      = "Config sauvegardee : $($script:configPath)"
     $lblConfigActif.ForeColor = [System.Drawing.Color]::DarkGreen
-    [System.Windows.Forms.MessageBox]::Show("Config exportee :`n$($script:configPath)", "Export OK")
+    [System.Windows.Forms.MessageBox]::Show("Config exportee :`n$($script:configPath)", "Export OK") | Out-Null
 })
 
 $btnChargerConfig.Add_Click({
@@ -650,11 +877,18 @@ $btnChargerConfig.Add_Click({
     $ofd.Filter   = "CSV|*.csv"
     $ofd.FileName = "config_ad.csv"
     if ($ofd.ShowDialog() -eq "OK") {
-        $script:configPath        = $ofd.FileName
-        $lblConfigActif.Text      = "Config : $($script:configPath)"
-        $lblConfigActif.ForeColor = [System.Drawing.Color]::Gray
-        Import-Config -Chemin $script:configPath
-        [System.Windows.Forms.MessageBox]::Show("Config chargee :`n$($script:configPath)", "Chargement OK")
+        $config = Import-Config -Chemin $ofd.FileName
+        if ($config) {
+            $script:configPath        = $ofd.FileName
+            $lblConfigActif.Text      = "Config : $($script:configPath)"
+            $lblConfigActif.ForeColor = [System.Drawing.Color]::Gray
+            $message = "Config chargee :`n$($script:configPath)"
+            if ($config.ColonneMotDePasseIgnoree) {
+                $message += "`n`nAncienne colonne MotDePasse ignoree : les mots de passe sont desormais generes. " +
+                            "Re-exportez la config pour supprimer ces mots de passe en clair du fichier."
+            }
+            [System.Windows.Forms.MessageBox]::Show($message, "Chargement OK") | Out-Null
+        }
     }
 })
 
@@ -663,7 +897,7 @@ $btnOuvrirConfig.Add_Click({
         Start-Process notepad.exe $script:configPath
     } else {
         [System.Windows.Forms.MessageBox]::Show(
-            "Aucune config trouvee.`nExporte d'abord une config.", "Introuvable")
+            "Aucune config trouvee.`nExporte d'abord une config.", "Introuvable") | Out-Null
     }
 })
 
@@ -673,7 +907,7 @@ $btnOuvrirConfig.Add_Click({
 $grpBoxOption          = New-Object System.Windows.Forms.GroupBox
 $grpBoxOption.Text     = "Placement des groupes dans l'AD"
 $grpBoxOption.Location = New-Object System.Drawing.Point(10, 615)
-$grpBoxOption.Size     = New-Object System.Drawing.Size(780, 80)
+$grpBoxOption.Size     = New-Object System.Drawing.Size(385, 80)
 $grpBoxOption.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.Controls.Add($grpBoxOption)
 
@@ -685,27 +919,46 @@ $radioAvecOU.Checked  = $true
 $grpBoxOption.Controls.Add($radioAvecOU)
 
 $radioDediee          = New-Object System.Windows.Forms.RadioButton
-$radioDediee.Text     = "Dans une OU dediee :"
+$radioDediee.Text     = "Dans une OU dediee (creee si absente) :"
 $radioDediee.Location = New-Object System.Drawing.Point(15, 48)
-$radioDediee.Size     = New-Object System.Drawing.Size(160, 22)
+$radioDediee.Size     = New-Object System.Drawing.Size(245, 22)
 $grpBoxOption.Controls.Add($radioDediee)
 
 $txtOUDediee          = New-Object System.Windows.Forms.TextBox
 $txtOUDediee.Text     = "Groupes"
-$txtOUDediee.Location = New-Object System.Drawing.Point(180, 46)
-$txtOUDediee.Size     = New-Object System.Drawing.Size(130, 22)
+$txtOUDediee.Location = New-Object System.Drawing.Point(262, 47)
+$txtOUDediee.Size     = New-Object System.Drawing.Size(110, 22)
 $txtOUDediee.Enabled  = $false
 $grpBoxOption.Controls.Add($txtOUDediee)
 
-$lblOUDedieeInfo           = New-Object System.Windows.Forms.Label
-$lblOUDedieeInfo.Text      = "(creee automatiquement si elle n'existe pas)"
-$lblOUDedieeInfo.Location  = New-Object System.Drawing.Point(320, 50)
-$lblOUDedieeInfo.Size      = New-Object System.Drawing.Size(380, 18)
-$lblOUDedieeInfo.ForeColor = [System.Drawing.Color]::Gray
-$grpBoxOption.Controls.Add($lblOUDedieeInfo)
-
 $radioDediee.Add_CheckedChanged({ $txtOUDediee.Enabled = $radioDediee.Checked })
 $radioAvecOU.Add_CheckedChanged({ $txtOUDediee.Enabled = $radioDediee.Checked })
+
+# ============================================================
+# OPTIONS D'EXECUTION (SECURITE)
+# ============================================================
+$grpBoxExecution          = New-Object System.Windows.Forms.GroupBox
+$grpBoxExecution.Text     = "Execution"
+$grpBoxExecution.Location = New-Object System.Drawing.Point(405, 615)
+$grpBoxExecution.Size     = New-Object System.Drawing.Size(385, 80)
+$grpBoxExecution.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$form.Controls.Add($grpBoxExecution)
+
+# Coche par defaut : un clic sur "Lancer" ne doit jamais ecrire dans l'AD par surprise.
+$chkSimulation          = New-Object System.Windows.Forms.CheckBox
+$chkSimulation.Text     = "Mode simulation (aucune ecriture dans l'AD)"
+$chkSimulation.Location = New-Object System.Drawing.Point(15, 22)
+$chkSimulation.Size     = New-Object System.Drawing.Size(360, 22)
+$chkSimulation.Checked  = $true
+$grpBoxExecution.Controls.Add($chkSimulation)
+
+# Decochee par defaut : le mot de passe d'un compte existant n'est jamais change en silence.
+$chkResetMdp          = New-Object System.Windows.Forms.CheckBox
+$chkResetMdp.Text     = "Reinitialiser les mots de passe des comptes existants"
+$chkResetMdp.Location = New-Object System.Drawing.Point(15, 48)
+$chkResetMdp.Size     = New-Object System.Drawing.Size(360, 22)
+$chkResetMdp.Checked  = $false
+$grpBoxExecution.Controls.Add($chkResetMdp)
 
 # ============================================================
 # BARRE DE PROGRESSION
@@ -722,7 +975,7 @@ $form.Controls.Add($progressBar)
 # BOUTON LANCER + LOG
 # ============================================================
 $btnLancer              = New-Object System.Windows.Forms.Button
-$btnLancer.Text         = "Lancer le provisioning"
+$btnLancer.Text         = "Lancer la simulation"
 $btnLancer.Location     = New-Object System.Drawing.Point(10, 727)
 $btnLancer.Size         = New-Object System.Drawing.Size(200, 34)
 $btnLancer.BackColor    = [System.Drawing.Color]::FromArgb(0, 120, 215)
@@ -730,6 +983,17 @@ $btnLancer.ForeColor    = [System.Drawing.Color]::White
 $btnLancer.FlatStyle    = "Flat"
 $btnLancer.Font         = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($btnLancer)
+
+# Le bouton change de texte et de couleur quand l'ecriture reelle est activee.
+$chkSimulation.Add_CheckedChanged({
+    if ($chkSimulation.Checked) {
+        $btnLancer.Text      = "Lancer la simulation"
+        $btnLancer.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    } else {
+        $btnLancer.Text      = "Lancer le provisioning"
+        $btnLancer.BackColor = [System.Drawing.Color]::FromArgb(196, 43, 28)
+    }
+})
 
 $txtLog               = New-Object System.Windows.Forms.RichTextBox
 $txtLog.Location      = New-Object System.Drawing.Point(220, 725)
@@ -745,180 +1009,117 @@ $form.Controls.Add($txtLog)
 # LOGIQUE PROVISIONING
 # ============================================================
 $btnLancer.Add_Click({
+    $simulation   = $chkSimulation.Checked
+    $reset        = $chkResetMdp.Checked
+    $groupes      = @($script:listeGroupes)
+    $utilisateurs = @(Get-UtilisateurGrille)
+    $ouDediee     = if ($radioDediee.Checked) { $txtOUDediee.Text.Trim() } else { "" }
 
-    $confirm = [System.Windows.Forms.MessageBox]::Show(
-        "Lancer le provisioning sur l'AD ?`nCette operation cree / modifie des comptes et des groupes.",
-        "Confirmation", "YesNo", "Question")
-    if ($confirm -ne "Yes") { return }
+    if ($radioDediee.Checked -and -not $ouDediee) {
+        [System.Windows.Forms.MessageBox]::Show("Indique le nom de l'OU dediee aux groupes.", "Attention") | Out-Null
+        return
+    }
+    if (($script:listeOUs.Count + $groupes.Count + $utilisateurs.Count) -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Rien a provisionner : ajoute des OUs, groupes ou utilisateurs, ou charge une config.", "Attention") | Out-Null
+        return
+    }
 
-    $btnLancer.Enabled   = $false
-    $progressBar.Value   = 0
+    # 1. Validation complete, avant tout contact avec l'AD
+    $erreurs = @(Get-ErreurConfiguration -OUs $script:listeOUs -Groupes $groupes -Utilisateurs $utilisateurs -OUDediee $ouDediee)
+    if ($erreurs.Count -gt 0) {
+        foreach ($e in $erreurs) { Write-Journal $e "ERR" }
+        $apercu = ($erreurs | Select-Object -First 12) -join "`n"
+        if ($erreurs.Count -gt 12) { $apercu += "`n... (liste complete dans le journal)" }
+        [System.Windows.Forms.MessageBox]::Show(
+            "Configuration invalide : $($erreurs.Count) erreur(s). Rien n'a ete lance.`n`n$apercu",
+            "Validation", "OK", "Warning") | Out-Null
+        return
+    }
 
     try { $domaine = Get-ADDomain -ErrorAction Stop }
     catch {
-        Write-Log "Impossible de contacter l'AD : $_" "ERR"
-        $btnLancer.Enabled = $true
+        Write-Journal "Impossible de contacter l'AD : $_" "ERR"
+        [System.Windows.Forms.MessageBox]::Show("Impossible de contacter l'AD :`n$_", "Erreur AD", "OK", "Error") | Out-Null
         return
     }
-    $dcRoot      = $domaine.DistinguishedName
-    $dnsDomain   = $domaine.DNSRoot
-    $modeDediee  = $radioDediee.Checked
-    $nomOUDediee = $txtOUDediee.Text.Trim()
 
-    # Calcul du total pour la barre de progression
-    $totalSteps = $script:listeOUs.Count + $script:listeGroupes.Count + $grid.Rows.Count
-    if ($modeDediee) { $totalSteps++ }
-    $step = 0
+    $txtReset = if ($reset) { "OUI" } else { "non" }
+    $recap    = "$($script:listeOUs.Count) OU(s), $($groupes.Count) groupe(s), $($utilisateurs.Count) utilisateur(s)"
+    if ($ouDediee) { $recap += ", groupes dans l'OU dediee '$ouDediee'" }
 
-    Write-Log "=== DEBUT PROVISIONING ===" "INFO"
-    Write-Log "Domaine : $dcRoot" "INFO"
-    if ($modeDediee) { Write-Log "Mode : groupes dans OU dediee '$nomOUDediee'" "INFO" }
-    else             { Write-Log "Mode : groupes dans l'OU de leurs utilisateurs" "INFO" }
-
-    # -- ETAPE 1 : OUs
-    Write-Log "--- Etape 1 : OUs ---" "INFO"
-    foreach ($ou in $script:listeOUs) {
-        $ouDN = "OU=$ou,$dcRoot"
-        try {
-            Get-ADOrganizationalUnit -Identity $ouDN -ErrorAction Stop | Out-Null
-            Write-Log "OU existe deja : $ou" "WARN"
-        } catch {
-            try {
-                New-ADOrganizationalUnit -Name $ou -Path $dcRoot
-                Write-Log "OU creee : $ou" "OK"
-            } catch { Write-Log "Erreur OU $ou : $_" "ERR" }
+    # 2. Recapitulatif et confirmation avant toute ecriture reelle ("Non" par defaut)
+    if (-not $simulation) {
+        $message = "ECRITURE REELLE dans le domaine $($domaine.DNSRoot)`n`n" +
+                   "  - $($script:listeOUs.Count) OU(s)`n" +
+                   "  - $($groupes.Count) groupe(s)`n" +
+                   "  - $($utilisateurs.Count) utilisateur(s) (crees, ou mis a jour s'ils existent)`n"
+        if ($ouDediee) { $message += "  - groupes places dans l'OU dediee '$ouDediee'`n" }
+        $message += "`nReinitialisation des mots de passe des comptes existants : $txtReset`n`n" +
+                    "Confirmer l'ecriture dans l'AD ?"
+        $rep = [System.Windows.Forms.MessageBox]::Show($message, "Confirmation", "YesNo", "Warning", "Button2")
+        if ($rep -ne "Yes") {
+            Write-Journal "Provisioning annule a l'etape de confirmation." "INFO"
+            return
         }
-        $step++
-        $progressBar.Value = [int]([Math]::Min(100, ($step / $totalSteps * 100)))
-        [System.Windows.Forms.Application]::DoEvents()
     }
 
-    # -- ETAPE 2 : OU dediee groupes
-    if ($modeDediee) {
-        Write-Log "--- Etape 2 : OU dediee groupes ---" "INFO"
-        $ouDedieDN = "OU=$nomOUDediee,$dcRoot"
-        try {
-            Get-ADOrganizationalUnit -Identity $ouDedieDN -ErrorAction Stop | Out-Null
-            Write-Log "OU dediee existe deja : $nomOUDediee" "WARN"
-        } catch {
-            try {
-                New-ADOrganizationalUnit -Name $nomOUDediee -Path $dcRoot
-                Write-Log "OU dediee creee : $nomOUDediee" "OK"
-            } catch { Write-Log "Erreur OU dediee : $_" "ERR" }
-        }
-        $step++
-        $progressBar.Value = [int]([Math]::Min(100, ($step / $totalSteps * 100)))
-        [System.Windows.Forms.Application]::DoEvents()
-    }
+    # 3. Execution : interface verrouillee, mots de passe gardes en memoire seulement
+    $controles = @($tabControl, $grpBoxConfig, $grpBoxOption, $grpBoxExecution, $btnLancer)
+    foreach ($ctrl in $controles) { $ctrl.Enabled = $false }
+    $progressBar.Value = 0
+    $motsDePasse = New-Object System.Collections.Generic.List[object]
+    $nbErreurs   = 0
+    try {
+        if ($simulation) { Write-Journal "=== DEBUT SIMULATION (aucune ecriture dans l'AD) ===" "INFO" }
+        else             { Write-Journal "=== DEBUT PROVISIONING ===" "INFO" }
+        Write-Journal "Domaine : $($domaine.DNSRoot) | Operateur : $env:USERDOMAIN\$env:USERNAME" "INFO"
+        Write-Journal "Recapitulatif : $recap | Reinitialisation des mots de passe existants : $txtReset" "INFO"
 
-    # -- ETAPE 3 : Groupes
-    Write-Log "--- Etape 3 : Groupes ---" "INFO"
-    foreach ($entry in $script:listeGroupes) {
-        $idx    = $entry.IndexOf($script:SEP)
-        $nom    = $entry.Substring(0, $idx).Trim()
-        $ouUser = $entry.Substring($idx + $script:SEP.Length).Trim()
-        $ouDN   = if ($modeDediee) { "OU=$nomOUDediee,$dcRoot" } else { "OU=$ouUser,$dcRoot" }
-        try {
-            Get-ADGroup -Identity $nom -ErrorAction Stop | Out-Null
-            Write-Log "Groupe existe deja : $nom" "WARN"
-        } catch {
-            try {
-                New-ADGroup -Name $nom -SamAccountName $nom -GroupScope Global -GroupCategory Security -Path $ouDN
-                Write-Log "Groupe cree : $nom" "OK"
-            } catch { Write-Log "Erreur groupe $nom : $_" "ERR" }
-        }
-        $step++
-        $progressBar.Value = [int]([Math]::Min(100, ($step / $totalSteps * 100)))
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-
-    # -- ETAPE 4 : Utilisateurs
-    Write-Log "--- Etape 4 : Utilisateurs ---" "INFO"
-    foreach ($row in $grid.Rows) {
-        $prenom = $row.Cells["Prenom"].Value
-        $nom    = $row.Cells["Nom"].Value
-        $login  = $row.Cells["Login"].Value
-        $mdp    = $row.Cells["MotDePasse"].Value
-        $ou     = $row.Cells["OU"].Value
-        $grp    = $row.Cells["Groupe"].Value
-
-        if (-not $login -or -not $ou -or -not $grp) {
-            Write-Log "Ligne incomplete, ignoree (login=$login)." "WARN"
-            $step++
-            $progressBar.Value = [int]([Math]::Min(100, ($step / $totalSteps * 100)))
-            [System.Windows.Forms.Application]::DoEvents()
-            continue
-        }
-
-        $ouDN     = "OU=$ou,$dcRoot"
-        $fullName = "$prenom $nom"
-        $existing = Get-ADUser -Filter { SamAccountName -eq $login } `
-                               -Properties DistinguishedName -ErrorAction SilentlyContinue
-
-        if ($existing) {
-            # Deplacer si l'OU a change
-            $currentParent = $existing.DistinguishedName.Substring(
-                $existing.DistinguishedName.IndexOf(',') + 1)
-            if ($currentParent -ne $ouDN) {
-                try {
-                    Move-ADObject -Identity $existing.DistinguishedName -TargetPath $ouDN
-                    Write-Log "  -> $login deplace vers $ou" "OK"
-                } catch { Write-Log "  -> Erreur deplacement $login : $_" "ERR" }
-            }
-            try {
-                Set-ADUser -Identity $login -GivenName $prenom -Surname $nom -DisplayName $fullName
-                if (-not [string]::IsNullOrWhiteSpace($mdp)) {
-                    $securePwd = ConvertTo-SecureString $mdp -AsPlainText -Force
-                    Set-ADAccountPassword -Identity $login -NewPassword $securePwd -Reset
-                }
-                Write-Log "User mis a jour : $login" "WARN"
-            } catch { Write-Log "Erreur MAJ $login : $_" "ERR"; continue }
-        } else {
-            if ([string]::IsNullOrWhiteSpace($mdp)) {
-                Write-Log "User $login ignore : mot de passe manquant pour la creation." "WARN"
-                $step++
-                $progressBar.Value = [int]([Math]::Min(100, ($step / $totalSteps * 100)))
+        $nbErreurs = Invoke-Provisioning -DomaineDN $domaine.DistinguishedName -DomaineDNS $domaine.DNSRoot `
+            -OUs $script:listeOUs -Groupes $groupes -Utilisateurs $utilisateurs -OUDediee $ouDediee `
+            -Simulation $simulation -ReinitialiserMdpExistants $reset -MotsDePasse $motsDePasse `
+            -Progression {
+                param($etape, $total)
+                $progressBar.Value = [int][Math]::Min(100, $etape * 100 / $total)
                 [System.Windows.Forms.Application]::DoEvents()
-                continue
             }
-            $securePwd = ConvertTo-SecureString $mdp -AsPlainText -Force
-            try {
-                New-ADUser -SamAccountName $login `
-                           -UserPrincipalName "$login@$dnsDomain" `
-                           -GivenName $prenom -Surname $nom -DisplayName $fullName -Name $fullName `
-                           -AccountPassword $securePwd -Path $ouDN -Enabled $true
-                Write-Log "User cree : $login" "OK"
-            } catch { Write-Log "Erreur creation $login : $_" "ERR"; continue }
-        }
+        Write-Journal "=== FIN : $nbErreurs erreur(s) ===" "INFO"
 
         try {
-            Add-ADGroupMember -Identity $grp -Members $login -ErrorAction Stop
-            Write-Log "  -> $login ajoute a $grp" "OK"
-        } catch { Write-Log "  -> Erreur groupe $grp pour $login : $_" "ERR" }
-
-        $step++
-        $progressBar.Value = [int]([Math]::Min(100, ($step / $totalSteps * 100)))
-        [System.Windows.Forms.Application]::DoEvents()
+            Save-Config
+            Write-Journal "Config sauvegardee (sans mot de passe) : $($script:configPath)" "INFO"
+        } catch { Write-Journal "Sauvegarde de la config impossible : $_" "WARN" }
+    } catch {
+        $nbErreurs++
+        Write-Journal "Arret inattendu : $_" "ERR"
+    } finally {
+        $progressBar.Value = 100
+        foreach ($ctrl in $controles) { $ctrl.Enabled = $true }
+        # Affichage unique, puis oubli : la liste n'a jamais existe qu'en memoire.
+        if ($motsDePasse.Count -gt 0) { Show-MotDePasseProvisoire -MotsDePasse $motsDePasse.ToArray() }
+        $motsDePasse.Clear()
     }
 
-    $progressBar.Value = 100
-    Write-Log "=== FIN PROVISIONING ===" "INFO"
-    Write-Log "Log : $script:logPath" "INFO"
-    Export-Config
-    Write-Log "Config sauvegardee : $($script:configPath)" "INFO"
-    $btnLancer.Enabled = $true
+    $bilan = if ($simulation) { "Simulation terminee : aucune modification dans l'AD." } else { "Provisioning termine." }
+    [System.Windows.Forms.MessageBox]::Show(
+        "$bilan`n$nbErreurs erreur(s).`n`nJournal : $($script:logPath)", "Termine", "OK", "Information") | Out-Null
 })
 
 # ============================================================
 # CHARGEMENT AUTO AU DEMARRAGE
 # ============================================================
 $form.Add_Shown({
+    Write-Journal "Journal : $($script:logPath)" "INFO"
+    Write-Journal "Mode simulation actif : decoche-le pour ecrire dans l'AD." "INFO"
     if (Test-Path $script:configPath) {
-        Import-Config -Chemin $script:configPath
-        $lblConfigActif.Text      = "Config auto-chargee : $($script:configPath)"
-        $lblConfigActif.ForeColor = [System.Drawing.Color]::DarkGreen
+        if (Import-Config -Chemin $script:configPath) {
+            $lblConfigActif.Text      = "Config auto-chargee : $($script:configPath)"
+            $lblConfigActif.ForeColor = [System.Drawing.Color]::DarkGreen
+        }
     }
 })
 
 # ============================================================
 $form.ShowDialog() | Out-Null
+$form.Dispose()

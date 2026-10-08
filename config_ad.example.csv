@@ -1,0 +1,12 @@
+﻿Type;Nom;OU;Login;Prenom;Nom2;Groupe
+OU;Direction;;;;;
+OU;Comptabilité;;;;;
+OU;Informatique;;;;;
+GROUPE;GG_Direction;Direction;;;;
+GROUPE;GG_Comptabilite;Comptabilité;;;;
+GROUPE;GG_Informatique;Informatique;;;;
+USER;;Direction;adupont;Alice;Dupont;GG_Direction
+USER;;Comptabilité;bmartin;Bruno;Martin;GG_Comptabilite
+USER;;Comptabilité;clefevre;Chloé;Lefèvre;GG_Comptabilite
+USER;;Informatique;dmoreau;David;Moreau;GG_Informatique
+USER;;Informatique;egarcia;Émilie;Garcia;
