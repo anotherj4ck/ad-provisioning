@@ -1,0 +1,13 @@
+# Journaux d'exécution (noms de comptes, domaine)
+logs/
+*.log
+
+# Sauvegardes git
+*.bundle
+
+# Ne jamais publier une vraie liste d'utilisateurs : seul l'exemple fictif est suivi
+*.csv
+!config_ad.example.csv
+
+# Ancien historique git, conservé en local uniquement
+.git-ancien/
