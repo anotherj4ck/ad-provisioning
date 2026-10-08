@@ -12,6 +12,10 @@ Le projet met l'accent sur la sécurité du provisioning : aucun mot de passe n'
 Chaque compte reçoit un mot de passe provisoire aléatoire, à changer à la première connexion.
 Rien n'est écrit dans l'annuaire sans simulation préalable et confirmation explicite.
 
+![Interface principale](docs/interface.png)
+
+![Mots de passe provisoires affichés une seule fois](docs/mots-de-passe.png)
+
 <!--
 ## Aperçu
 
